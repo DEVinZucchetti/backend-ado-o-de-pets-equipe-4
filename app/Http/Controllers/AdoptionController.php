@@ -2,13 +2,20 @@
 
 namespace App\Http\Controllers;
 
-use App\Mail\SendWelcomePet;
+use App\Mail\SendDocuments;
+use App\Models\Adoption;
 use App\Models\Client;
+use App\Models\File;
 use App\Models\People;
 use App\Models\Pet;
+use App\Models\SolicitationDocument;
 use App\Traits\HttpResponses;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+
 use Symfony\Component\HttpFoundation\Response;
 
 class AdoptionController extends Controller
@@ -69,5 +76,116 @@ class AdoptionController extends Controller
         if (!$pet) return $this->error('Dado não encontrado', Response::HTTP_NOT_FOUND);
 
         return $pet;
+    }
+
+    public function store(Request $request)
+    {
+        try {
+            $data = $request->all(); // pegar o body
+
+            $request->validate([
+                'name' => 'string|required|max:255',
+                'contact' => 'string|required|max:20',
+                'email' => 'string|required',
+                'cpf' => 'string|required',
+                'observations' => 'string|required',
+                'pet_id' => 'integer|required',
+            ]); // valida os dados
+
+            $adoption = Adoption::create([...$data, 'status' => 'PENDENTE']);
+            return $adoption;
+        } catch (\Exception $exception) {
+            return $this->error($exception->getMessage(), Response::HTTP_BAD_REQUEST);
+        }
+    }
+
+    public function getAdoptions()
+    {
+        $adoptions = Adoption::query()->with('pet')->get();
+        return $adoptions;
+    }
+
+    public function approve(Request $request)
+    {
+
+        try {
+
+            DB::beginTransaction();
+
+            $data = $request->all();
+
+            $request->validate([
+                'adoption_id' => 'integer|required',
+            ]);
+
+            $adoption = Adoption::find($data['adoption_id']);
+
+            if (!$adoption)  return $this->error('Dado não encontrado', Response::HTTP_NOT_FOUND);
+
+            $adoption->update(['status' => 'APROVADO']);
+            $adoption->save();
+
+            $people = People::create([
+                'name' => $adoption->name,
+                'email' => $adoption->email,
+                'cpf' => $adoption->cpf,
+                'contact' => $adoption->contact,
+            ]);
+
+            $client = Client::create([
+                'people_id' => $people->id,
+                'bonus' => true
+            ]);
+
+            $pet = Pet::find($adoption->pet_id);
+            $pet->update(['client_id' => $client->id]);
+            $pet->save();
+
+            $solicitation = SolicitationDocument::create([
+                'client_id' => $client->id
+            ]);
+
+            //  Mail::to($people->email, $people->name)
+            //      ->send(new SendDocuments($people->name, $solicitation->id));
+
+            DB::commit();
+
+            return $client;
+        } catch (\Exception $exception) {
+            DB::rollBack();
+            return $this->error($exception->getMessage(), Response::HTTP_BAD_REQUEST);
+        }
+    }
+
+    public function upload(Request $request)
+    {
+
+        $file = $request->file('file');
+        $description =  $request->input('description');
+        $key =  $request->input('key');
+        $id =  $request->input('id');
+
+        $slugName = Str::of($description)->slug();
+        $fileName = $slugName . '.' . $file->extension();
+
+        $pathBucket = Storage::disk('s3')->put('documentos', $file);
+        $fullPathFile = Storage::disk('s3')->url($pathBucket);
+
+        $file = File::create(
+            [
+                'name' => $fileName,
+                'size' => $file->getSize(),
+                'mime' => $file->extension(),
+                'url' => $fullPathFile
+            ]
+        );
+
+        $solicitation = SolicitationDocument::find($id);
+
+        if(!$solicitation) return $this->error('Dado não encontrado', Response::HTTP_NOT_FOUND);
+
+        $solicitation->update([$key => $file->id]);
+
+        return ['message' => 'Arquivo criado com sucesso'];
     }
 }
